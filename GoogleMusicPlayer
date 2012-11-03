@@ -1,0 +1,186 @@
+#!/usr/bin/env python2
+# vim: ts=4 st=4 sts=4 expandtab syntax=python
+import sys, os, gi
+
+from gi.repository import GLib, Gio, Soup
+
+# flash plugin doesn't work with gtk3
+# please install nspluginwrapper + adobe-flash 32bit
+USE_GTK2 = True
+
+if USE_GTK2:
+    gi.require_version('Gtk', '2.0')
+    gi.require_version('Gdk', '2.0')
+    gi.require_version('WebKit', '1.0')
+from gi.repository import Gtk, Gdk, WebKit
+
+BASE_PATH = os.path.join(os.getenv('HOME'), ".google_music_player")
+DATABASE_PATH = os.path.join(BASE_PATH, "database")
+COOKIE_FILE = os.path.join(BASE_PATH, "cookie.txt")
+URL = "https://play.google.com/music/listen#all"
+
+APP_NAME = "Google Music Player"
+
+class Player(Gtk.Window):
+    def __init__(self):
+        Gtk.Window.__init__(self)
+        view = WebKit.WebView()
+        self.add(view)
+        self.webview = view
+
+        self.setup_webview(view)
+        self.setup_cookie_manager()
+        self.request_bus_for_media_keys()
+
+        self.connect("destroy", Gtk.main_quit)
+        view.connect("notify::load-status", self.load_callback)
+        self.set_default_size(800, 600)
+        view.load_uri(URL)
+
+    def request_bus_for_media_keys(self):
+        cancellable = Gio.Cancellable()
+        proxy = Gio.DBusProxy.new_for_bus(
+                Gio.BusType.SESSION,
+                Gio.DBusProxyFlags.DO_NOT_AUTO_START |
+                    Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES,
+                None,
+                "org.gnome.SettingsDaemon",
+                "/org/gnome/SettingsDaemon/MediaKeys",
+                "org.gnome.SettingsDaemon.MediaKeys",
+                cancellable,
+                self.grab_media_keys,
+                None)
+    
+    def grab_media_keys(self, proxy, result, arg):
+        proxy = Gio.DBusProxy.new_for_bus_finish(result)
+        cancellable = Gio.Cancellable()
+        playerName = GLib.Variant("(su)", (APP_NAME, 0))
+        proxy.call("GrabMediaPlayerKeys", playerName,
+                Gio.DBusCallFlags.NONE, -1, cancellable,
+                self.grab_media_keys_callback, None)
+        proxy.connect("g-signal", self.media_player_keys_pressed)
+
+    def grab_media_keys_callback(self, proxy, result, *args):
+        r = proxy.call_finish(result)
+
+    def media_player_keys_pressed(self, proxy, sender, signal, param, *args):
+        if signal != 'MediaPlayerKeyPressed':
+            return
+        app, cmd = param.unpack()
+        if app != APP_NAME:
+            return
+        self.handle_media_key(cmd)
+
+    def send_event(self, type, x, y):
+        display = self.get_display()
+        event = Gdk.EventButton()
+        event.type = type
+        event.window = self.webview.window
+        event.time = Gdk.CURRENT_TIME
+        event.x, event.y = x, y
+        event.state = Gdk.ModifierType.BUTTON1_MASK
+        event.button = 1
+        display.put_event(event)
+
+    def emit_click_event(self, div):
+        attr = self.webview.get_viewport_attributes()
+        ratio = attr.props.device_pixel_ratio
+
+        # calculate button position on screen
+        top = div.get_offset_top()
+        y = (top + div.get_offset_height()/2) * ratio
+        left = div.get_offset_left()
+        x = (left + div.get_offset_width()/2) * ratio
+
+        # Send raw mouse event explicitly through Gtk
+        # because these elements don't handle DOM click event
+        self.send_event(Gdk.EventType.BUTTON_PRESS, x, y)
+        GLib.timeout_add(200, self.send_event, 
+                Gdk.EventType.BUTTON_RELEASE, x, y)
+
+    def handle_media_key(self, cmd):
+        dom = self.webview.get_dom_document()
+        if cmd == 'Play':
+            playPause = dom.get_element_by_id('playPause')
+            self.emit_click_event(playPause)
+        elif cmd == 'Previous':
+            rew = dom.get_element_by_id('rew')
+            self.emit_click_event(rew)
+        elif cmd == 'Next':
+            ff = dom.get_element_by_id('ff')
+            self.emit_click_event(ff)
+        elif cmd == 'Stop':
+            playPause = dom.get_element_by_id('playPause')
+            title = playPause.get_attribute("title")
+            if title == 'Pause':
+                self.emit_click_event(playPause)
+        elif cmd == 'FastForward':
+            ff = dom.get_element_by_id('ff')
+            self.emit_click_event(ff)
+        elif cmd == 'Rewind':
+            rew = dom.get_element_by_id('rew')
+            self.emit_click_event(rew)
+        elif cmd == 'Repeat':
+            repeat = dom.get_element_by_id('repeat_mode_button')
+            repeat.click()
+        elif cmd == 'Shuffle':
+            shuffle = dom.get_element_by_id('shuffle_mode_button')
+            shuffle.click()
+        else:
+            print 'unknown command:', cmd
+            
+    def update_song_info(self):
+        songInfo = dom.get_element_by_id('playerSongInfo')
+        songTitle = dom.get_element_by_id('playerSongTitle')
+        artist = dom.get_element_by_id('playerArtist')
+
+        if songTitle:
+            print 'title:', songTitle.get_text_content()
+        if artist:
+            print 'artist:', artist.get_text_content()
+
+    def load_callback(self, webview, psepc):
+        if webview.get_load_status() == WebKit.LoadStatus.FINISHED:
+            favicon = webview.try_get_favicon_pixbuf(64, 64)
+            if favicon:
+                self.set_default_icon(favicon)
+                self.set_icon(favicon)
+
+    def setup_cookie_manager(self):
+        session = WebKit.get_default_session()
+        jar = Soup.CookieJarText.new(COOKIE_FILE, False)
+        jar.set_accept_policy(Soup.CookieJarAcceptPolicy.ALWAYS)
+        session.add_feature(jar)
+
+    def setup_webview(self, webview):
+        WebKit.set_web_database_directory_path(DATABASE_PATH)
+        settings = webview.get_settings()
+        settings.props.enable_webaudio = True
+        settings.props.enable_site_specific_quirks = True
+        settings.props.enable_page_cache = True
+        settings.props.enable_html5_database = True
+        settings.props.enable_html5_local_storage = True
+        settings.props.enable_offline_web_application_cache = True
+        settings.props.html5_local_storage_database_path = DATABASE_PATH
+        if not USE_GTK2:
+            settings.props.enable_smooth_scrolling = True
+            settings.props.media_playback_allows_inline = True
+        webview.set_settings(settings)
+
+if __name__ == '__main__':
+    player = Player()
+    player.show_all()
+
+    exchook = sys.excepthook
+    def new_hook(type, value, traceback):
+        if isinstance(value, KeyboardInterrupt):
+            Gtk.main_quit()
+            return
+        return exchook(type, value, traceback)
+
+    sys.excepthook = new_hook
+
+    # it should raise KeyboardInterrupt
+    GLib.timeout_add(500, lambda : True)
+
+    Gtk.main()
